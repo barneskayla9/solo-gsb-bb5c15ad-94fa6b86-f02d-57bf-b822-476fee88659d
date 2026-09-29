@@ -180,3 +180,30 @@ class AlertAckIn(BaseModel):
 class AlertList(BaseModel):
     device_id: str
     alerts: list[AlertOut]
+
+
+# --------------------------------------------------------------------------- #
+# field data-quality audit (字段数据质量核查)
+# --------------------------------------------------------------------------- #
+
+class FieldQualityReport(BaseModel):
+    device_id: str
+    field: str
+    seq_from: int
+    seq_to: int
+    # Committed records in the interval: the audit universe. buffered /
+    # gap_filled records and duplicate deliveries are not counted.
+    committed_count: int
+    # Committed records whose top-level field is a finite number.
+    valid_count: int
+    # Committed records with the field missing or carrying an invalid value
+    # (boolean / string / non-finite number). Equals committed - valid.
+    invalid_count: int
+    # Contiguous closed seq intervals inside [seq_from, seq_to] without a
+    # committed record; adjacent holes (buffered, gap_filled, declared 断档)
+    # are merged into one range.
+    missing_ranges: list[list[int]]
+    # Statistics over valid values; all three are null without any valid value.
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    avg_value: Optional[float] = None

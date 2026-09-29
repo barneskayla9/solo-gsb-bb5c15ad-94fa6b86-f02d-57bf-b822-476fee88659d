@@ -341,3 +341,25 @@ def write_txn(conn: sqlite3.Connection):
         raise
     else:
         conn.execute("COMMIT")
+
+
+@contextmanager
+def read_txn(conn: sqlite3.Connection):
+    """Deferred read transaction pinning one consistent snapshot.
+
+    Connections open in WAL/autocommit mode otherwise begin an implicit
+    transaction per statement, so two SELECTs may observe different states
+    when a writer commits between them. A read-only endpoint that must derive
+    counts, aggregates and gap ranges from the same state wraps all of its
+    SELECTs here: the first read opens an SNAPSHOT transaction and every read
+    inside sees the same database image. Never issues a write, so it never
+    blocks other readers or writers.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")

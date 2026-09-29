@@ -75,7 +75,7 @@ CLOSE_GAP = "gap"          # a declared 断档 ended the segment
 CLOSE_VERSION = "version"  # a newer rule version took over the first later record
 
 
-def _as_number(value) -> Optional[float]:
+def as_number(value) -> Optional[float]:
     """Return `value` as a finite float, or None if it is not a real number.
 
     Booleans are excluded (they are ints in Python but not measurements) and
@@ -399,7 +399,7 @@ class AlertEngine:
             # that itself ends the segment can only ever record one closing.
             self._close_older_versions(rule["id"], version["id"], seq, CLOSE_VERSION, now)
             raw = payload.get(version["field"]) if payload is not None else None
-            self._advance_version(device_id, version, seq, _as_number(raw), now)
+            self._advance_version(device_id, version, seq, as_number(raw), now)
 
     def _version_for_seq(self, rule_id: int, seq: int):
         """The unique version of rule_id whose effective_seq range covers seq.

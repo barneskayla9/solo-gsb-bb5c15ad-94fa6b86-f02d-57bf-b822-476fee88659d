@@ -20,7 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from .alerts import AlertEngine, EffectiveSeqConflict, RuleNotFound
 from .config import Settings
 from .cursor import Cursor, CursorError, decode_cursor, encode_cursor
-from .db import connect, init_db, write_txn
+from .db import connect, init_db, read_txn, write_txn
 from .models import (
     AlertAckIn,
     AlertList,
@@ -32,11 +32,13 @@ from .models import (
     AlertVersionList,
     BatchIn,
     BatchResponse,
+    FieldQualityReport,
     RecordOut,
     RecordPage,
     RecordResult,
     WindowSummary,
 )
+from .quality import DeviceNotFound, QualityAuditor
 from .window import WindowEngine
 
 logger = logging.getLogger("telemetry")
@@ -47,6 +49,10 @@ API_PREFIX = "/api/v1"
 # page falls back to the default and the cursor pins it for later pages).
 RECORDS_DEFAULT_LIMIT = 100
 RECORDS_MAX_LIMIT = 1000
+
+# Maximum closed-interval length accepted by the field-quality audit
+# (seq_to - seq_from + 1).
+QUALITY_MAX_RANGE_LENGTH = 10_000
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -68,13 +74,14 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="Device Telemetry Ingest API",
-        version="1.2.0",
+        version="1.3.0",
         description="Local telemetry receiver with per-device sliding-window "
         "ordering, idempotent dedup, gap (断档) detection and replay, "
         "consecutive-threshold alerting on committed records with versioned "
-        "alert rules, an idempotent alert acknowledgement workflow, and "
+        "alert rules, an idempotent alert acknowledgement workflow, "
         "separately persisted at-most-once segment-end (active/closed) "
-        "records with reasons record/gap/version.",
+        "records with reasons record/gap/version, and a snapshot-consistent "
+        "per-device field data-quality audit over a closed seq interval.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -278,6 +285,53 @@ def create_app(settings: Settings) -> FastAPI:
             ],
             next_cursor=next_cursor,
         )
+
+    # -------------------------------------------------------------- #
+    # field data-quality audit (字段数据质量核查)
+    # -------------------------------------------------------------- #
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/field-quality",
+        response_model=FieldQualityReport,
+    )
+    def field_quality(
+        device_id: str,
+        field: str = Query(
+            min_length=1,
+            max_length=128,
+            description="Top-level payload field to audit; a blank name is rejected.",
+        ),
+        seq_from: int = Query(ge=0, description="Closed interval start (inclusive)"),
+        seq_to: int = Query(ge=0, description="Closed interval end (inclusive)"),
+        conn=Depends(get_conn),
+    ):
+        """Audit one telemetry field's data quality over a closed seq range.
+
+        Counts only records with status 'committed': buffered records,
+        断档补录 (gap_filled) rows and duplicate deliveries never contribute.
+        A top-level value counts as valid only when it is a finite number
+        (booleans/strings/NaN/Infinity are invalid). Returns committed/valid/
+        invalid counts, the contiguous uncommitted seq ranges, and the valid
+        values' min/max/avg (all null when there is no valid value). Counts,
+        statistics and gaps are computed from one read-only snapshot
+        transaction, so concurrent batches cannot make them disagree.
+        """
+        if seq_from > seq_to:
+            raise HTTPException(status_code=400, detail="seq_from must be <= seq_to")
+        if seq_to - seq_from + 1 > QUALITY_MAX_RANGE_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"interval length must not exceed {QUALITY_MAX_RANGE_LENGTH}",
+            )
+        field = field.strip()
+        if not field:
+            raise HTTPException(status_code=400, detail="field must not be blank")
+        with read_txn(conn):
+            try:
+                return QualityAuditor(conn).audit(device_id, field, seq_from, seq_to)
+            except DeviceNotFound:
+                raise HTTPException(
+                    status_code=404, detail=f"unknown device: {device_id}"
+                )
 
     # -------------------------------------------------------------- #
     # gaps & replay

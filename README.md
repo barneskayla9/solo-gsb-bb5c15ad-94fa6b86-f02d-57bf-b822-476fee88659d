@@ -393,6 +393,73 @@ GET /api/v1/devices/{device_id}/alerts?rule_id=1&status=acknowledged
 `active=true` 过滤与 `closing: null` 等价（如刚触发、后续仍持续越限尚未结束的告警）；
 旧库迁移来的历史告警没有结束记录，也以 `active: true` 返回。
 
+### 字段数据质量核查（按设备 + 序列号闭区间）
+
+```
+GET /api/v1/devices/{device_id}/field-quality?field=temp&seq_from=1&seq_to=1000
+```
+
+运维按设备核查一段**闭区间**序列号内某个遥测字段的数据质量。查询参数：
+
+| 参数 | 说明 |
+|---|---|
+| `field` | 必填，payload **顶层字段名**（1–128 字符；纯空白拒绝）；外层空白会被 trim |
+| `seq_from` / `seq_to` | 必填，闭区间起止序号，均须 **≥ 0** 且 `seq_from <= seq_to`；区间长度（`seq_to - seq_from + 1`）最多 **10000** |
+
+**统计口径**：只看 `status = 'committed'` 的记录；`buffered`（仍在暂存）、
+`gap_filled`（断档补录）与重复上报（`duplicate`，本就不会重复落库）**一律不计入**。
+字段值仅在为**有限数值**（int/float 且非 NaN/Infinity）时计为**有效**；
+布尔值、字符串、`null`、数组/对象、字段缺失以及非有限数均为**无效**（仅取顶层字段，
+不递归嵌套对象）。
+
+响应字段：
+
+| 字段 | 说明 |
+|---|---|
+| `committed_count` | 区间内已提交（committed）记录数——本次核查的全集 |
+| `valid_count` | 其中字段为有效有限数值的记录数 |
+| `invalid_count` | 其中字段缺失或数值无效的记录数（= committed − valid） |
+| `missing_ranges` | 区间内**未提交**的连续序列号区间 `[[start, end], ...]`，按序号升序；缺口之间只要没有 committed 记录（buffered、gap_filled、已声明断档均不算）就**合并为一段** |
+| `min_value` / `max_value` / `avg_value` | 有效值的最小/最大/平均值；**没有有效值时三个均为 `null`** |
+
+**同一快照**：一次核查的全部读取包在同一个只读快照事务（`BEGIN` deferred read）中，
+并发接收批次时计数、统计值与缺口区间必然来自同一个数据库状态，不会互相矛盾
+（只读事务不阻塞写入）。未知设备返回 **404**；`seq_from > seq_to` 或区间超长返回 **400**；
+参数缺失/为负/字段为纯空白返回 **400/422**。
+
+```json
+{
+  "device_id": "dev-001",
+  "field": "temp",
+  "seq_from": 1,
+  "seq_to": 10,
+  "committed_count": 8,
+  "valid_count": 6,
+  "invalid_count": 2,
+  "missing_ranges": [[3, 4], [9, 9]],
+  "min_value": 20.0,
+  "max_value": 33.0,
+  "avg_value": 26.25
+}
+```
+
+调用示例：
+
+```bash
+# 核查 dev-001 在 seq 1..1000 内 temp 字段的数据质量
+curl 'localhost:8000/api/v1/devices/dev-001/field-quality?field=temp&seq_from=1&seq_to=1000'
+
+# Python（标准库）
+python3 - <<'PY'
+import json, urllib.parse, urllib.request
+params = urllib.parse.urlencode({"field": "temp", "seq_from": 1, "seq_to": 1000})
+with urllib.request.urlopen(
+    f"http://localhost:8000/api/v1/devices/dev-001/field-quality?{params}"
+) as resp:
+    print(json.dumps(json.load(resp), indent=2, ensure_ascii=False))
+PY
+```
+
 ### 确认告警
 
 ```
@@ -441,7 +508,6 @@ POST /api/v1/devices/{device_id}/alerts/{alert_id}/acknowledge
 - `GET /api/v1/devices` — 设备列表
 - `GET /health` — 健康检查
 - `GET /` — 服务信息与当前配置
-
 ## 完整流程示例
 
 ```bash
@@ -552,11 +618,13 @@ app/
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
   alerts.py   # 版本化连续阈值告警引擎（版本追加/按 seq 原子选版/规则推进/断档中断/告警生成/区段结束 record·gap·version）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
+  quality.py  # 字段数据质量核查引擎（仅 committed、有效值判定、缺口合并、同快照统计）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
   test_api.py          # 乱序/幂等/断档/重放/回锚/并发一致性测试
   test_records.py      # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
+  test_quality.py      # 字段数据质量核查：计数/有效性/缺口合并/参数校验/并发同快照测试
   test_alerts.py       # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算/确认工作流/迁移测试
   test_rule_versions.py # 规则版本化：版本切换/按 seq 唯一选版/历史冻结/迁移/真实服务并发测试
   test_alert_closings.py # 异常区段结束：record/gap/version 三种原因、最多一次、不提前结束、active 过滤/旧库建表/并发测试
@@ -604,3 +672,9 @@ pytest tests/ -q
 过滤可与 `status` 组合（非法值 422）、多规则独立结束；旧库启动自动幂等建表（历史告警
 初始 active，迁移后仍可正常结束）；真实 uvicorn 服务下 16 线程并发重复上报结束序号时
 每条告警恰好一条结束记录、active 过滤与落库行数一致。
+字段数据质量核查：已提交/有效/无效计数、缺字段与布尔/字符串/null/NaN/Infinity/数组/对象
+均判无效、仅顶层字段、整数计为有效、无有效值时 min/max/avg 均为 null、区间裁剪与空区间、
+buffered/已声明断档/gap_filled 均不计数且缺口与未到达序号合并为连续区间（边界起止正确）、
+重复上报不改变结果、未知设备 404、纯空白字段拒绝、负序号 422、区间反转 400、长度超 10000
+返回 400、缺参数 422；真实 uvicorn 服务下 8 写线程持续提交、2 读线程并发核查时每次响应的
+计数恒等式成立、缺口区间与已提交数恰好覆盖整个闭区间且有序互不相邻（同一快照自洽）。
