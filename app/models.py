@@ -53,6 +53,23 @@ class RecordPage(BaseModel):
     next_cursor: Optional[str] = None
 
 
+class FieldQualityOut(BaseModel):
+    device_id: str
+    field: str
+    seq_from: int
+    seq_to: int
+    committed_count: int   # committed records inside the closed interval
+    valid_count: int       # committed records whose field is a finite number
+    invalid_count: int     # committed records with the field missing or invalid
+    # Contiguous still-uncommitted seq ranges inside the interval: buffered,
+    # gap_filled and never-received sequences all count as uncommitted.
+    uncommitted_ranges: list[list[int]]
+    # Valid-value statistics; all three are null when valid_count == 0.
+    min: Optional[float] = None
+    max: Optional[float] = None
+    avg: Optional[float] = None
+
+
 class AlertRuleIn(BaseModel):
     field: str = Field(
         min_length=1, max_length=128,

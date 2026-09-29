@@ -32,11 +32,13 @@ from .models import (
     AlertVersionList,
     BatchIn,
     BatchResponse,
+    FieldQualityOut,
     RecordOut,
     RecordPage,
     RecordResult,
     WindowSummary,
 )
+from .quality import field_quality
 from .window import WindowEngine
 
 logger = logging.getLogger("telemetry")
@@ -47,6 +49,9 @@ API_PREFIX = "/api/v1"
 # page falls back to the default and the cursor pins it for later pages).
 RECORDS_DEFAULT_LIMIT = 100
 RECORDS_MAX_LIMIT = 1000
+
+# Largest closed seq interval a single field-quality audit may cover.
+QUALITY_MAX_SPAN = 10_000
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -68,13 +73,14 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="Device Telemetry Ingest API",
-        version="1.2.0",
+        version="1.3.0",
         description="Local telemetry receiver with per-device sliding-window "
         "ordering, idempotent dedup, gap (断档) detection and replay, "
         "consecutive-threshold alerting on committed records with versioned "
-        "alert rules, an idempotent alert acknowledgement workflow, and "
+        "alert rules, an idempotent alert acknowledgement workflow, "
         "separately persisted at-most-once segment-end (active/closed) "
-        "records with reasons record/gap/version.",
+        "records with reasons record/gap/version, and per-field data-quality "
+        "audits over closed seq intervals.",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -278,6 +284,49 @@ def create_app(settings: Settings) -> FastAPI:
             ],
             next_cursor=next_cursor,
         )
+
+    # -------------------------------------------------------------- #
+    # per-field data-quality audit
+    # -------------------------------------------------------------- #
+    @app.get(
+        f"{API_PREFIX}/devices/{{device_id}}/field-quality",
+        response_model=FieldQualityOut,
+    )
+    def field_quality_report(
+        device_id: str,
+        seq_from: int = Query(ge=0),
+        seq_to: int = Query(ge=0),
+        field: str = Query(min_length=1, max_length=128),
+        conn=Depends(get_conn),
+    ):
+        """Audit one top-level payload field over a closed seq interval.
+
+        Counts committed records, valid numeric values and missing/invalid
+        ones, lists the contiguous still-uncommitted seq ranges inside the
+        interval, and summarises the valid values (min/max/avg, null when
+        there are none). Only committed rows count — buffered, gap_filled
+        and duplicate resubmissions are excluded. The lazy 断档 sweep and
+        the whole computation share one BEGIN IMMEDIATE transaction, so
+        concurrent ingestion cannot mix partial states into the report.
+        """
+        if seq_from > seq_to:
+            raise HTTPException(status_code=400, detail="seq_from must be <= seq_to")
+        if seq_to - seq_from + 1 > QUALITY_MAX_SPAN:
+            raise HTTPException(
+                status_code=400,
+                detail=f"interval too long: at most {QUALITY_MAX_SPAN} sequences",
+            )
+        if not field.strip():
+            raise HTTPException(status_code=400, detail="field must not be blank")
+        eng = engine(conn)
+        with write_txn(conn):
+            dev = eng.get_device(device_id)
+            if dev is None:
+                raise HTTPException(status_code=404, detail=f"unknown device: {device_id}")
+            # Declare expired gaps first, so the audit sees the same state
+            # the window/gaps endpoints would report at this moment.
+            eng.sweep_device(dev)
+            return field_quality(conn, device_id, seq_from, seq_to, field)
 
     # -------------------------------------------------------------- #
     # gaps & replay

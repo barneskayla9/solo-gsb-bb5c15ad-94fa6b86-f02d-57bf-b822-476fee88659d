@@ -1,6 +1,6 @@
 # 设备遥测接收 API（device-telemetry-ingest）
 
-基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置**版本化告警规则**（修改规则即追加递增版本、可指定生效序列号，历史版本与已生成告警永久冻结），对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。告警触发后还会为越限**异常区段**单独持久化一条**结束记录**（区段是否仍 `active`、结束序号/时间/原因 `record`·`gap`·`version`，每条告警最多结束一次，不改动原告警快照与确认状态）。
+基于 **FastAPI + SQLite** 的本地设备遥测接收服务。设备按批次上报带递增序列号的遥测记录，批次可能乱序到达；服务为每台设备维护一个**滑动窗口**，实现乱序暂存、重复幂等丢弃、超时断档标记与断档重放，并在并发请求下保持状态一致。另支持**连续阈值告警**：按设备配置**版本化告警规则**（修改规则即追加递增版本、可指定生效序列号，历史版本与已生成告警永久冻结），对已提交记录按序检测连续越限并生成可查询告警；每条告警携带 `open`/`acknowledged` 状态，可通过**幂等确认接口**由确认人标记为已确认（记录确认人与确认时间，重复确认不改变首次确认信息）。告警触发后还会为越限**异常区段**单独持久化一条**结束记录**（区段是否仍 `active`、结束序号/时间/原因 `record`·`gap`·`version`，每条告警最多结束一次，不改动原告警快照与确认状态）。此外提供**字段数据质量核查**：按设备与闭区间 seq 统计某个 payload 顶层字段的已提交记录数、有效/无效数值数、未提交序列区间及有效值的最小/最大/平均值，供运维按设备核查一段序列的数据质量。
 
 ## 快速启动
 
@@ -199,6 +199,55 @@ GET /api/v1/devices/{device_id}/records?cursor=<next_cursor>
   "next_cursor": "eyJ2IjoxLC...9oZg.4f3b2a...9c"
 }
 ```
+
+### 字段数据质量核查
+
+```
+GET /api/v1/devices/{device_id}/field-quality?seq_from=1&seq_to=100&field=temp
+```
+
+按设备核查闭区间 `[seq_from, seq_to]` 内某个 payload **顶层字段**的数据质量，供运维
+逐设备、逐段序列核对上报完整性。参数均为必填：
+
+| 参数 | 说明 |
+|---|---|
+| `seq_from` / `seq_to` | 序列号闭区间，均须 ≥ 0 且 `seq_from ≤ seq_to`；区间长度最多 **10000** 个序列 |
+| `field` | payload 顶层字段名，非空（空白亦拒绝） |
+
+响应示例：
+
+```json
+{
+  "device_id": "dev-001",
+  "field": "temp",
+  "seq_from": 1,
+  "seq_to": 100,
+  "committed_count": 95,
+  "valid_count": 90,
+  "invalid_count": 5,
+  "uncommitted_ranges": [[20, 22], [50, 54]],
+  "min": 18.5,
+  "max": 33.2,
+  "avg": 25.1
+}
+```
+
+语义约定：
+
+- **只统计 `committed` 记录**：`buffered`（仍等待前方缺口）、`gap_filled`（断档补录）
+  与重复上报（幂等丢弃，不产生新记录）都不计入 `committed_count`。
+- **有效数值**：字段存在且为有限数值；布尔值、字符串、数组/对象、`null` 及
+  NaN/Infinity 均为无效。`committed_count = valid_count + invalid_count`。
+- **未提交区间** `uncommitted_ranges`：区间内所有非 committed 的序列（含暂存、
+  补录与从未到达的序列）按相邻关系合并为连续区间；与 committed 序列恰好互补铺满
+  整个查询区间。
+- **统计值**：`min`/`max`/`avg` 仅基于有效值；区间内没有任何有效值时三者均为 `null`。
+- **快照一致性**：核查先惰性判定已超时断档（与 window/gaps 端点一致），随后整个
+  统计在同一 `BEGIN IMMEDIATE` 事务内完成——并发接收的批次不会把中间状态混入
+  计数、统计值或缺口。
+
+错误码：未知设备 **404**；`seq_from > seq_to`、区间长度超过 10000、字段为空白
+**400**；`seq` 为负、字段缺失或为空 **422**。
 
 ### 查询断档
 
@@ -478,6 +527,13 @@ curl 'localhost:8000/api/v1/devices/dev-001/records?seq_from=1&seq_to=100&limit=
 curl 'localhost:8000/api/v1/devices/dev-001/records?cursor=eyJ2Ijox...'
 # -> 翻页直至 next_cursor 为 null，区间内每条记录恰好返回一次
 
+# 7b. 字段数据质量核查：dev-001 在 [1,100] 内 temp 字段的上报质量
+curl 'localhost:8000/api/v1/devices/dev-001/field-quality?seq_from=1&seq_to=100&field=temp'
+# -> {"committed_count": 95, "valid_count": 90, "invalid_count": 5,
+#     "uncommitted_ranges": [[20, 22], [50, 54]],
+#     "min": 18.5, "max": 33.2, "avg": 25.1, ...}
+#    只统计 committed 记录；无有效值时 min/max/avg 均为 null
+
 # 8. 创建连续阈值告警规则：temp 连续 3 条 > 30 触发
 curl -X POST localhost:8000/api/v1/devices/dev-001/alert-rules \
   -H 'Content-Type: application/json' \
@@ -552,11 +608,13 @@ app/
   window.py   # 滑动窗口核心引擎（提交/暂存/断档/重放/回锚）
   alerts.py   # 版本化连续阈值告警引擎（版本追加/按 seq 原子选版/规则推进/断档中断/告警生成/区段结束 record·gap·version）
   cursor.py   # HMAC 签名的不透明分页游标（高水位 + 键集位置）
+  quality.py  # 字段数据质量核查（committed 计数/有效值统计/未提交区间，单事务快照）
   models.py   # 请求/响应模型
   main.py     # FastAPI 应用、路由、后台断档扫描器
 tests/
   test_api.py          # 乱序/幂等/断档/重放/回锚/并发一致性测试
   test_records.py      # 一致性分页：快照隔离/游标篡改/跨设备/区间变更测试
+  test_field_quality.py # 字段数据质量核查：计数/有效性规则/统计/未提交区间/参数校验/并发快照一致性
   test_alerts.py       # 连续阈值告警：规则 CRUD/连续计数/断档中断/补录不重算/确认工作流/迁移测试
   test_rule_versions.py # 规则版本化：版本切换/按 seq 唯一选版/历史冻结/迁移/真实服务并发测试
   test_alert_closings.py # 异常区段结束：record/gap/version 三种原因、最多一次、不提前结束、active 过滤/旧库建表/并发测试
@@ -604,3 +662,10 @@ pytest tests/ -q
 过滤可与 `status` 组合（非法值 422）、多规则独立结束；旧库启动自动幂等建表（历史告警
 初始 active，迁移后仍可正常结束）；真实 uvicorn 服务下 16 线程并发重复上报结束序号时
 每条告警恰好一条结束记录、active 过滤与落库行数一致。
+字段数据质量核查：基本计数与 min/max/avg、缺字段/布尔/字符串/数组/null/NaN/Infinity
+均判无效、只读顶层字段、无有效值时统计值为 null、空区间全未提交、未提交区间相邻合并、
+buffered 与 gap_filled 不计入且列为未提交、重复上报不改变计数、惰性断档判定对核查可见、
+未知设备 404、区间倒置/超长（>10000）/空白字段 400、负 seq 或缺字段参数 422；
+真实 uvicorn 服务下 8 线程并发提交 800 条记录时并发核查的每次响应都满足
+快照一致性（committed = valid + invalid、committed 与未提交区间互补铺满区间、
+min ≤ avg ≤ max），最终统计精确落定。
